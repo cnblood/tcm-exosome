@@ -1,0 +1,5 @@
+content = open('.dockerignore').read()
+print('Before:', repr(content))
+content = content.replace('data/*.db\n', '').replace('data/*.db', '')
+open('.dockerignore', 'w').write(content)
+print('After:', repr(content))

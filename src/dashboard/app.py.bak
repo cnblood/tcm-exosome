@@ -1,0 +1,470 @@
+﻿"""
+TCM-Exosome Platform v2
+Supabase + SQLite Integrated Dashboard
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import os, sys, math, requests, sqlite3
+from datetime import datetime
+
+
+# =========================
+# Data fixing functions
+# =========================
+def fix_papers_display(df):
+    """修复论文显示问题"""
+    if df.empty:
+        return df
+    
+    df_fixed = df.copy()
+    
+    # 修复source显示
+    source_fixes = {
+        'Pharmacopoeia_易根': 'Pharmacopoeia_葛根',
+        'Pharmacopoeia_洋羊藿': 'Pharmacopoeia_淫羊藿',
+    }
+    
+    for wrong, correct in source_fixes.items():
+        if 'source' in df_fixed.columns:
+            df_fixed['source'] = df_fixed['source'].replace(wrong, correct)
+    
+    # 智能分类
+    if 'title' in df_fixed.columns and 'category' in df_fixed.columns:
+        categories = {
+            'exosome': 'Exosome Biology',
+            'nanovesicle': 'Nanovesicle Research',
+            'extracellular vesicle': 'EV Research',
+            'osteoclast': 'Bone Metabolism',
+            'inflammation': 'Inflammation',
+            'neurotransmitter': 'Neuroscience',
+            'pharmacokinetics': 'Pharmacokinetics',
+            'cholesterol': 'Lipid Metabolism',
+            'cerebellar': 'Neuroscience',
+            'mitochondrial': 'Cell Biology',
+        }
+        
+        def get_category(title):
+            if pd.isna(title):
+                return 'Uncategorized'
+            title_lower = str(title).lower()
+            for key, cat in categories.items():
+                if key in title_lower:
+                    return cat
+            return 'General'
+        
+        df_fixed['category'] = df_fixed['title'].apply(get_category)
+    
+    # 修复URL
+    if 'url' in df_fixed.columns and 'title' in df_fixed.columns:
+        import urllib.parse
+        
+        def get_url(row):
+            if pd.notna(row.get('url')) and str(row['url']) not in ['None', 'N/A', '', '#']:
+                return row['url']
+            if pd.notna(row.get('title')):
+                query = urllib.parse.quote(str(row['title']))
+                return f"https://scholar.google.com/scholar?q={query}"
+            return '#'
+        
+        df_fixed['url'] = df_fixed.apply(get_url, axis=1)
+    
+    return df_fixed
+
+
+sys.path.insert(0, "/app")
+
+# =========================
+# Page config
+# =========================
+st.set_page_config(
+    page_title="TCM-Exosome Platform",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+DB_PATH      = os.environ.get("DB_PATH", "/app/data/tcm_exosome.db")
+
+# =========================
+# Styles
+# =========================
+st.markdown("""
+<style>
+.metric-card {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid #0f3460;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    color: white;
+}
+.metric-value { font-size: 2.2rem; font-weight: bold; color: #e94560; }
+.metric-label { font-size: 0.85rem; color: #a8b2d8; margin-top: 5px; }
+.section-header {
+    background: linear-gradient(90deg, #0f3460, #1a1a2e);
+    color: white;
+    padding: 10px 20px;
+    border-radius: 8px;
+    margin: 20px 0 10px 0;
+    font-size: 1.1rem;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Supabase helpers
+# =========================
+def sb_query(table, select="*", filters=None, limit=2000, order=None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return pd.DataFrame()
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    params = {"select": select, "limit": limit}
+    if filters:
+        params.update(filters)
+    if order:
+        params["order"] = order
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=headers,
+            params=params,
+            timeout=20
+        )
+        if r.status_code == 200 and r.json():
+            return pd.DataFrame(r.json())
+    except Exception as e:
+        st.error(f"Supabase error ({table}): {e}")
+    return pd.DataFrame()
+
+def sb_count(table, eq_filter=None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Prefer": "count=exact",
+        "Range": "0-0",
+    }
+    params = {}
+    if eq_filter:
+        for k, v in eq_filter.items():
+            params[k] = f"eq.{v}"
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        cr = r.headers.get("Content-Range", "0/0")
+        return int(cr.split("/")[-1])
+    except:
+        return 0
+
+# =========================
+# SQLite helpers
+# =========================
+@st.cache_resource
+def get_sqlite():
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    return None
+
+def qdf(sql, params=()):
+    conn = get_sqlite()
+    if conn is None:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    except:
+        return pd.DataFrame()
+
+def scalar(sql, params=()):
+    conn = get_sqlite()
+    if conn is None:
+        return 0
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return row[0] if row else 0
+    except:
+        return 0
+
+# =========================
+# Data cleaning functions
+# =========================
+def clean_papers_data(df):
+    """Clean and deduplicate papers data"""
+    if df.empty:
+        return df
+    
+    # Make a copy to avoid warnings
+    df_clean = df.copy()
+    
+    # Replace None/NaN with appropriate values
+    df_clean['title'] = df_clean['title'].fillna('Untitled')
+    df_clean['source'] = df_clean['source'].fillna('Unknown Source')
+    df_clean['category'] = df_clean['category'].fillna('Uncategorized')
+    
+    # Handle URL - if None, generate a placeholder or leave as empty string
+    df_clean['url'] = df_clean['url'].fillna('#')
+    
+    # Remove duplicates based on title (case-insensitive)
+    df_clean['title_lower'] = df_clean['title'].str.lower()
+    df_clean = df_clean.drop_duplicates(subset=['title_lower'], keep='first')
+    df_clean = df_clean.drop(columns=['title_lower'])
+    
+    # Remove rows where title is just placeholder/empty
+    df_clean = df_clean[~df_clean['title'].isin(['Untitled', '', 'None', 'null'])]
+    
+    # Sort by title for better display
+    df_clean = df_clean.sort_values('title').reset_index(drop=True)
+    
+    return df_clean
+
+def clean_herb_data(df):
+    """Clean and deduplicate herb data"""
+    if df.empty:
+        return df
+    
+    df_clean = df.copy()
+    
+    # Handle missing values
+    df_clean['chinese_name'] = df_clean['chinese_name'].fillna('Unknown')
+    df_clean['latin_name'] = df_clean['latin_name'].fillna('Unknown')
+    df_clean['taxonomy_family'] = df_clean['taxonomy_family'].fillna('Unclassified')
+    df_clean['research_focus'] = df_clean['research_focus'].fillna('General')
+    df_clean['data_level'] = df_clean['data_level'].fillna('preliminary')
+    
+    # Handle boolean fields
+    df_clean['exosome_evidence'] = df_clean['exosome_evidence'].fillna(False)
+    
+    # Remove duplicates based on chinese_name + latin_name
+    df_clean['name_key'] = df_clean['chinese_name'].str.lower() + '|' + df_clean['latin_name'].str.lower()
+    df_clean = df_clean.drop_duplicates(subset=['name_key'], keep='first')
+    df_clean = df_clean.drop(columns=['name_key'])
+    
+    return df_clean
+
+# =========================
+# Sidebar
+# =========================
+with st.sidebar:
+    if st.button('🔄 强制刷新数据 (Clear Cache)'):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("## TCM-Exosome")
+    st.markdown("---")
+    page = st.radio("Navigation", [
+        "Overview",
+        "Herb Evidence DB",
+        "Literature",
+        "Clinical Trials",
+        "Genomics",
+        "Knowledge Graph",
+        "Crawler Status",
+    ])
+    st.markdown("---")
+    
+    # Add data quality info
+    if SUPABASE_URL:
+        st.success("✅ Supabase connected")
+    else:
+        st.warning("⚠️ Supabase not configured")
+    
+    # Show deduplication status
+    st.info("🔄 Auto-deduplication enabled")
+    
+    st.caption(f"Updated: {datetime.now():%Y-%m-%d %H:%M}")
+
+# =========================
+# Overview
+# =========================
+if page == "Overview":
+    st.markdown("# TCM-Exosome Intelligence Platform")
+    st.markdown("*Traditional Chinese Medicine × Exosome Research*")
+
+    papers   = sb_count("papers")
+    trials   = scalar("SELECT COUNT(*) FROM clinical_trials")
+    genes    = sb_count("genes")
+    evidence = sb_count("tcm_single_herb", {"exosome_evidence": "true"})
+
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(val,label) in zip(
+        [c1,c2,c3,c4],
+        [
+            (papers,  "Research Papers"),
+            (trials,  "Clinical Trials"),
+            (genes,   "Target Genes"),
+            (evidence,"Herbs with Evidence"),
+        ]
+    ):
+        col.markdown(
+            f'<div class="metric-card">'
+            f'<div class="metric-value">{val:,}</div>'
+            f'<div class="metric-label">{label}</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    st.markdown('<div class="section-header">📚 Latest Papers (Deduplicated)</div>', unsafe_allow_html=True)
+    
+    # Get and clean papers data
+    df_latest = sb_query(
+        "papers",
+        select="title,source,category,url,created_at",
+        limit=50,  # Get more for better deduplication
+        order="created_at.desc"
+    )
+    
+    if not df_latest.empty:
+        # Apply cleaning
+        df_clean = clean_papers_data(df_latest)
+        
+        # Show stats
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption(f"📊 Total records: {len(df_latest)}")
+        with col2:
+            st.caption(f"✨ Unique after dedup: {len(df_clean)}")
+        
+        # Prepare display dataframe
+        display_df = df_clean[['title', 'source', 'category', 'url']].head(8)
+        
+        # Format URL column to be clickable
+        display_df['url'] = display_df['url'].apply(
+            lambda x: f'<a href="{x}" target="_blank">🔗 Link</a>' if x and x != '#' else 'N/A'
+        )
+        
+        # Display as HTML table for clickable links
+        st.write(display_df.to_html(escape=False, index=False), unsafe_allow_html=True)
+        
+        # Alternative: use dataframe with column config
+        # st.dataframe(
+        #     display_df,
+        #     use_container_width=True,
+        #     hide_index=True,
+        #     column_config={
+        #         "url": st.column_config.LinkColumn("URL")
+        #     }
+        # )
+    else:
+        st.info("No papers data available")
+
+# =========================
+# Herb Evidence DB
+# =========================
+elif page == "Herb Evidence DB":
+    st.markdown("# 🌿 TCM Herb Exosome Evidence Database")
+
+    df = sb_query(
+        "tcm_single_herb",
+        select="chinese_name,latin_name,taxonomy_family,exosome_evidence,research_focus,data_level",
+        limit=800,
+        order="chinese_name.asc"
+    )
+
+    if df.empty:
+        st.warning("No herb data available.")
+        st.stop()
+
+    # Clean herb data
+    df_clean = clean_herb_data(df)
+    
+    # Show deduplication info
+    if len(df) > len(df_clean):
+        st.info(f"✨ Removed {len(df) - len(df_clean)} duplicate entries")
+
+    total = len(df_clean)
+    validated = len(df_clean[df_clean["data_level"] == "validated"])
+    with_ev = len(df_clean[df_clean["exosome_evidence"] == True])
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Total Herbs", total)
+    c2.metric("Validated (AI)", validated)
+    c3.metric("With Exosome Evidence", with_ev)
+
+    st.markdown("### Filter")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        ev_filter = st.selectbox(
+            "Exosome Evidence",
+            ["All", "Has Evidence", "No Evidence"]
+        )
+    
+    with col2:
+        data_level_filter = st.multiselect(
+            "Data Level",
+            options=df_clean['data_level'].unique(),
+            default=[]
+        )
+
+    # Apply filters
+    df_f = df_clean.copy()
+    
+    if ev_filter == "Has Evidence":
+        df_f = df_f[df_f["exosome_evidence"] == True]
+    elif ev_filter == "No Evidence":
+        df_f = df_f[df_f["exosome_evidence"] == False]
+    
+    if data_level_filter:
+        df_f = df_f[df_f['data_level'].isin(data_level_filter)]
+
+    # Display dataframe with better formatting
+    st.dataframe(
+        df_f.rename(columns={
+            "chinese_name": "Chinese Name",
+            "latin_name": "Latin Name",
+            "taxonomy_family": "Family",
+            "exosome_evidence": "Exosome Evidence",
+            "research_focus": "Research Focus",
+            "data_level": "Data Level"
+        }),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Exosome Evidence": st.column_config.CheckboxColumn("Evidence")
+        }
+    )
+
+    # Export with cleaned data
+    csv = df_f.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "📥 Export CSV (Cleaned)",
+        csv,
+        file_name=f"tcm_exosome_cleaned_{datetime.now():%Y%m%d}.csv",
+        mime="text/csv"
+    )
+
+    st.success(
+        "✅ Data source: Chinese Pharmacopoeia 2025 | "
+        "🔬 AI analysis: Groq llama-3.3-70b | "
+        "🔄 Auto-deduplication enabled"
+    )
+
+# Add placeholder for other pages
+elif page in ["Literature", "Clinical Trials", "Genomics", "Knowledge Graph", "Crawler Status"]:
+    st.markdown(f"# {page}")
+    st.info(f"🚧 {page} page is under construction")
+    
+    # Show some sample data for Literature page
+    if page == "Literature":
+        st.markdown("### Sample Literature Data")
+        df = sb_query("papers", limit=5)
+        if not df.empty:
+            df_clean = clean_papers_data(df)
+            st.dataframe(df_clean, use_container_width=True)
