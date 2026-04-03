@@ -5,7 +5,23 @@
 # 模块功能: Streamlit 主应用入口，页面路由与全局状态管理
 # 开发日期: 2026-01-20
 # -------------------------------------------------------------------------
+import os
+import sys
+import warnings
 
+
+# 忽略特定 RuntimeWarning（expire_cache）
+warnings.filterwarnings("ignore", message="coroutine 'expire_cache' was never awaited")
+
+
+# 添加项目路径（防止 src 模块问题）
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+sys.path.insert(0, project_root)
+sys.path.insert(0, current_dir)
+
+print(f"🔧 项目根路径已添加: {project_root}")
+# =====================================================================
 import streamlit as st
 import pandas as pd
 import plotly.express as px
